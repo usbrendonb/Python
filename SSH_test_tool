@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+
+import subprocess
+import getpass
+import csv
+import re
+import time
+from itertools import product
+from datetime import datetime
+
+
+def get_supported_algorithms(algo_type):
+    """
+    Query OpenSSH for supported algorithms.
+    """
+
+    try:
+        result = subprocess.run(
+            ["ssh", "-Q", algo_type],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+
+        return [
+            line.strip()
+            for line in result.stdout.splitlines()
+            if line.strip()
+        ]
+
+    except Exception as e:
+        print(f"Failed to query {algo_type}: {e}")
+        return []
+
+
+def choose_algorithms(items, name):
+
+    print(f"\nAvailable {name} Algorithms\n")
+
+    for idx, item in enumerate(items, start=1):
+        print(f"{idx:3d} - {item}")
+
+    print("\n0 - ALL")
+
+    choice = input(
+        f"\nSelect {name} (0=ALL): "
+    ).strip()
+
+    if choice == "0":
+        return items
+
+    try:
+        index = int(choice) - 1
+        return [items[index]]
+    except Exception:
+        print("Invalid selection")
+        exit(1)
+
+
+def run_test(
+    host,
+    username,
+    password,
+    cipher,
+    mac,
+    kex,
+    hostkey
+):
+
+    cmd = [
+        "sshpass",
+        "-p",
+        password,
+        "ssh",
+        "-vv",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "PreferredAuthentications=password",
+        "-o", "PubkeyAuthentication=no",
+        "-o", "ConnectTimeout=10",
+
+        "-o", f"Ciphers={cipher}",
+        "-o", f"MACs={mac}",
+        "-o", f"KexAlgorithms={kex}",
+        "-o", f"HostKeyAlgorithms={hostkey}",
+
+        f"{username}@{host}",
+        "exit"
+    ]
+
+    start_time = time.time()
+
+    try:
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+
+        elapsed = round(
+            time.time() - start_time,
+            3
+        )
+
+        output = (
+            result.stdout +
+            result.stderr
+        )
+
+        success = (
+            result.returncode == 0
+            or "Authentication succeeded" in output
+        )
+
+        negotiated_cipher = "UNKNOWN"
+        negotiated_mac = "UNKNOWN"
+        negotiated_kex = "UNKNOWN"
+        negotiated_hostkey = "UNKNOWN"
+
+        cipher_match = re.search(
+            r"kex: server->client cipher: ([^\s]+).*?mac: ([^\s]+)",
+            output
+        )
+
+        if cipher_match:
+            negotiated_cipher = cipher_match.group(1)
+            negotiated_mac = cipher_match.group(2)
+
+        kex_match = re.search(
+            r"kex: algorithm: ([^\s]+)",
+            output
+        )
+
+        if kex_match:
+            negotiated_kex = kex_match.group(1)
+
+        hostkey_match = re.search(
+            r"kex: host key algorithm: ([^\s]+)",
+            output
+        )
+
+        if hostkey_match:
+            negotiated_hostkey = hostkey_match.group(1)
+
+        cipher_ok = (
+            cipher == negotiated_cipher
+        )
+
+        mac_ok = (
+            mac == negotiated_mac
+        )
+
+        kex_ok = (
+            kex == negotiated_kex
+        )
+
+        hostkey_ok = (
+            hostkey == negotiated_hostkey
+        )
+
+        passed = (
+            success
+            and cipher_ok
+            and mac_ok
+            and kex_ok
+            and hostkey_ok
+        )
+
+        return {
+            "success": success,
+            "passed": passed,
+
+            "negotiated_cipher":
+                negotiated_cipher,
+
+            "negotiated_mac":
+                negotiated_mac,
+
+            "negotiated_kex":
+                negotiated_kex,
+
+            "negotiated_hostkey":
+                negotiated_hostkey,
+
+            "elapsed":
+                elapsed,
+
+            "returncode":
+                result.returncode
+        }
+
+    except Exception as e:
+
+        return {
+            "success": False,
+            "passed": False,
+            "error": str(e),
+            "elapsed": 0,
+            "returncode": -1
+        }
+
+
+def main():
+
+    print("\nSSH Algorithm Validation Tool")
+    print("=" * 60)
+
+    host = input(
+        "\nHost/IP: "
+    ).strip()
+
+    username = input(
+        "Username: "
+    ).strip()
+
+    password = getpass.getpass(
+        "Password: "
+    )
+
+    print("\nQuerying supported algorithms...\n")
+
+    ciphers = get_supported_algorithms(
+        "cipher"
+    )
+
+    macs = get_supported_algorithms(
+        "mac"
+    )
+
+    kexs = get_supported_algorithms(
+        "kex"
+    )
+
+    hostkeys = get_supported_algorithms(
+        "key"
+    )
+
+    selected_ciphers = choose_algorithms(
+        ciphers,
+        "Cipher"
+    )
+
+    selected_macs = choose_algorithms(
+        macs,
+        "MAC"
+    )
+
+    selected_kexs = choose_algorithms(
+        kexs,
+        "KEX"
+    )
+
+    selected_hostkeys = choose_algorithms(
+        hostkeys,
+        "HostKey"
+    )
+
+    connections = int(
+        input(
+            "\nConnections per test: "
+        )
+    )
+
+    timestamp = datetime.now().strftime(
+        "%Y%m%d_%H%M%S"
+    )
+
+    csv_file = (
+        f"ssh_results_{timestamp}.csv"
+    )
+
+    total_tests = (
+        len(selected_ciphers)
+        * len(selected_macs)
+        * len(selected_kexs)
+        * len(selected_hostkeys)
+        * connections
+    )
+
+    current_test = 0
+
+    with open(
+        csv_file,
+        "w",
+        newline=""
+    ) as csvfile:
+
+        writer = csv.writer(csvfile)
+
+        writer.writerow([
+            "Timestamp",
+            "Host",
+
+            "RequestedCipher",
+            "NegotiatedCipher",
+
+            "RequestedMAC",
+            "NegotiatedMAC",
+
+            "RequestedKEX",
+            "NegotiatedKEX",
+
+            "RequestedHostKey",
+            "NegotiatedHostKey",
+
+            "PASS",
+
+            "ConnectionTime",
+            "ReturnCode"
+        ])
+
+        for (
+            cipher,
+            mac,
+            kex,
+            hostkey
+        ) in product(
+            selected_ciphers,
+            selected_macs,
+            selected_kexs,
+            selected_hostkeys
+        ):
+
+            for attempt in range(
+                connections
+            ):
+
+                current_test += 1
+
+                print(
+                    f"\n[{current_test}/{total_tests}]"
+                )
+
+                print(
+                    f"Cipher   : {cipher}"
+                )
+
+                print(
+                    f"MAC      : {mac}"
+                )
+
+                print(
+                    f"KEX      : {kex}"
+                )
+
+                print(
+                    f"Host Key : {hostkey}"
+                )
+
+                result = run_test(
+                    host,
+                    username,
+                    password,
+                    cipher,
+                    mac,
+                    kex,
+                    hostkey
+                )
+
+                status = (
+                    "PASS"
+                    if result["passed"]
+                    else "FAIL"
+                )
+
+                print(
+                    f"Status   : {status}"
+                )
+
+                if result["success"]:
+
+                    print(
+                        f"Negotiated Cipher   : "
+                        f"{result['negotiated_cipher']}"
+                    )
+
+                    print(
+                        f"Negotiated MAC      : "
+                        f"{result['negotiated_mac']}"
+                    )
+
+                    print(
+                        f"Negotiated KEX      : "
+                        f"{result['negotiated_kex']}"
+                    )
+
+                    print(
+                        f"Negotiated Host Key : "
+                        f"{result['negotiated_hostkey']}"
+                    )
+
+                    print(
+                        f"Time                : "
+                        f"{result['elapsed']} sec"
+                    )
+
+                writer.writerow([
+                    datetime.now().isoformat(),
+                    host,
+
+                    cipher,
+                    result.get(
+                        "negotiated_cipher",
+                        ""
+                    ),
+
+                    mac,
+                    result.get(
+                        "negotiated_mac",
+                        ""
+                    ),
+
+                    kex,
+                    result.get(
+                        "negotiated_kex",
+                        ""
+                    ),
+
+                    hostkey,
+                    result.get(
+                        "negotiated_hostkey",
+                        ""
+                    ),
+
+                    status,
+
+                    result.get(
+                        "elapsed",
+                        ""
+                    ),
+
+                    result.get(
+                        "returncode",
+                        ""
+                    )
+                ])
+
+    print("\n")
+    print("=" * 60)
+    print("Testing Complete")
+    print("=" * 60)
+    print(
+        f"\nCSV Results Written To:\n"
+        f"{csv_file}"
+    )
+
+
+if __name__ == "__main__":
+    main()
